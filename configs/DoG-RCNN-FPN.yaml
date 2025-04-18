@@ -1,12 +1,12 @@
 VERSION: 2
 MODEL:
-  DOG:
-    KERNEL_SIZE: 5
-    SIGMA1: 1.0
-    SIGMA2: 2.0
-  META_ARCHITECTURE: "DOG-RCNN"
+  # DOG:
+  #   KERNEL_SIZE: 5
+  #   SIGMA1: 1.0
+  #   SIGMA2: 2.0
+  META_ARCHITECTURE: "DoGRCNN"
   BACKBONE:
-    NAME: "build_resnet_dog_fpn_backbone"
+    NAME: "build_resnet_fpn_backbone"
   RESNETS:
     OUT_FEATURES: ["res2", "res3", "res4", "res5"]
   FPN:
@@ -34,7 +34,7 @@ DATASETS:
   TRAIN: ("coco_2017_train",)
   TEST: ("coco_2017_val",)
 SOLVER:
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 4
   BASE_LR: 0.02
   STEPS: (60000, 80000)
   MAX_ITER: 90000

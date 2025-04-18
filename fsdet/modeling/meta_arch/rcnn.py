@@ -37,11 +37,18 @@ class DoGRCNN(nn.Module):
         self.backbone = build_backbone(cfg)
 
         # DoG filter as a layer applied to the raw image tensor
+        # self.dog_layer = DoGLayer(
+        #     channels=3,
+        #     kernel_size=cfg.MODEL.DOG.KERNEL_SIZE,
+        #     sigma1=cfg.MODEL.DOG.SIGMA1,
+        #     sigma2=cfg.MODEL.DOG.SIGMA2
+        # )
+
         self.dog_layer = DoGLayer(
             channels=3,
-            kernel_size=cfg.MODEL.DOG.KERNEL_SIZE,
-            sigma1=cfg.MODEL.DOG.SIGMA1,
-            sigma2=cfg.MODEL.DOG.SIGMA2
+            kernel_size=5,
+            sigma1=1,
+            sigma2=2
         )
         
         # CBAM fusion modules for each FPN level
