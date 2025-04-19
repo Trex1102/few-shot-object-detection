@@ -27,7 +27,7 @@ __all__ = ["DoGRCNN", "DoGRCNN_low_levels_only"
 
 
 @META_ARCH_REGISTRY.register()
-class DoGRCNN(nn.Module):
+class DoGRCNN_low_levels_only(nn.Module):
     """
     DOG R-CNN: computes DoG-filtered images on the fly from the raw 3-channel input,
     extracts features via a single shared backbone, fuses raw+DoG features with CBAM,
