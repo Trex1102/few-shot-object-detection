@@ -7,6 +7,7 @@ from detectron2.modeling.proposal_generator import build_proposal_generator
 from detectron2.structures import ImageList
 from detectron2.utils.logger import log_first_n
 from torch import nn
+import torch.nn.functional as F
 
 from fsdet.modeling.roi_heads import build_roi_heads
 
@@ -22,13 +23,13 @@ from torchvision.models._utils import IntermediateLayerGetter
 # avoid conflicting with the existing GeneralizedRCNN module in Detectron2
 from .build import META_ARCH_REGISTRY
 
-__all__ = ["GeneralizedRCNN", "ProposalNetwork", "DoG-RCNN", "SegmentationRCNN_final_logits_all_levels", 
+__all__ = ["SegmentationRCNN_final_logits_all_levels", 
             "SegmentationRCNN_level_wise_features"
 ]
 
 
 @META_ARCH_REGISTRY.register()
-class SegmentationRCNN_final_logits_all_levels(nn.Module):
+class SegmentationRCNN_level_wise_features(nn.Module):
     
     """
     SegmentationRCNN: uses a pretrained DeepLabV3+ResNet101 segmentation stream
@@ -142,9 +143,8 @@ class SegmentationRCNN_final_logits_all_levels(nn.Module):
 
         # 1. Preprocess raw images into ImageList
         images = self.preprocess_image(batched_inputs)
-
-        # 2) Segmentation feature extraction
-        feats_seg = self.extract_seg_features(images.tensor, images.image_sizes)
+        feats_raw = self.backbone(images.tensor)
+        
 
         # 3) Extract segmentation backbone features (multi-level)
         with torch.no_grad():
