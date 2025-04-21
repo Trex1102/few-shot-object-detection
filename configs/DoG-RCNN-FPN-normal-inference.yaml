@@ -34,7 +34,11 @@ DATASETS:
   TRAIN: ("coco_2017_train",)
   TEST: ("coco_2017_val",)
 SOLVER:
+<<<<<<< HEAD
   IMS_PER_BATCH: 8
+=======
+  IMS_PER_BATCH: 4
+>>>>>>> e76f2bb151873eec86f1b863a029f0e827fe13ae
   BASE_LR: 0.02
   STEPS: (60000, 80000)
   MAX_ITER: 90000
