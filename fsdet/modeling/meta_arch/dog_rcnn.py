@@ -465,6 +465,7 @@ class DoGRCNN_low_levels_only(nn.Module):
 
 @META_ARCH_REGISTRY.register()
 class DoGRCNN_normal_inference(nn.Module):
+    
     """
     DOG R-CNN: computes DoG-filtered images on the fly from the raw 3-channel input,
     extracts features via a single shared backbone, fuses raw+DoG features with CBAM,
@@ -558,10 +559,13 @@ class DoGRCNN_normal_inference(nn.Module):
         # 2. Compute DoG images from the same tensor
         dog_images = self.dog_layer(images.tensor)
         images_dog = ImageList(dog_images, images.image_sizes)
+        del dog_images
 
         # 3. Extract features from raw and DoG streams
         feats_raw = self.backbone(images.tensor)
+        del images
         feats_dog = self.backbone(images_dog.tensor)
+        del images_dog
 
         # 4. Fuse features per FPN level
         feats_fused = {
