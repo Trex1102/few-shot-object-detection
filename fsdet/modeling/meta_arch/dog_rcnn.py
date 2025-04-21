@@ -563,7 +563,7 @@ class DoGRCNN_normal_inference(nn.Module):
 
         # 3. Extract features from raw and DoG streams
         feats_raw = self.backbone(images.tensor)
-        del images
+        
         feats_dog = self.backbone(images_dog.tensor)
         del images_dog
 
