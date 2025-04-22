@@ -15,7 +15,7 @@ from fsdet.modeling.layers.dog_layer import DoGLayer2
 # avoid conflicting with the existing GeneralizedRCNN module in Detectron2
 from .build import META_ARCH_REGISTRY
 
-__all__ = ["DoGRCNNV2", "ProposalNetwork"]
+__all__ = ["DoGRCNNV2"]
 
 
 @META_ARCH_REGISTRY.register()
