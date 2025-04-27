@@ -494,3 +494,49 @@ class StandardROIHeads(ROIHeads):
                 self.test_detections_per_img,
             )
             return pred_instances
+
+
+@ROI_HEADS_REGISTRY.register()
+class ParallelFusionROIHeads(StandardROIHeads):
+    """
+    Parallel Feature Fusion:
+      - context branch
+      - shape branch
+      - fuse with RoI features
+    """
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        # assume box head produces 256-dim features
+        self.context_branch = ContextBranch(
+            feature_strides=[stride for stride in self.box_in_features],
+            output_size=7
+        )
+        self.shape_branch = ShapeBranch(in_channels=256)
+        # override box predictor to accept fused dim
+        self.box_predictor = FastRCNNOutputLayers(
+            # input channels = original + context + shape
+            in_channels=256 + 256 + 256,
+            **self.cfg.MODEL.ROI_BOX_HEAD.PREDICTOR_PARAMS
+        )
+
+    def _forward_box(self, features, proposals):
+        # extract standard RoI features
+        box_feats = self.box_pooler(
+            features, [x.proposal_boxes for x in proposals], [x._image_index for x in proposals]
+        )  # list of tensors
+        box_feats = self.box_head(box_feats)
+        # get context and shape
+        ctx_feats = self.context_branch(features, proposals)
+        shp_feats = self.shape_branch(box_feats)
+        # fuse: for each image, concat per proposal
+        fused_feats = []
+        for bf, cf, sf in zip(box_feats, ctx_feats, shp_feats):
+            # bf: N x C x S x S, cf: N x C x S x S, sf: N x C_vec
+            # flatten and concat
+            bf_flat = bf.view(bf.size(0), -1)
+            cf_flat = cf.view(cf.size(0), -1)
+            fused = torch.cat([bf_flat, cf_flat, sf], dim=1)
+            fused_feats.append(fused)
+        # run predictor
+        losses, detections = self.box_predictor([f.view(-1) for f in fused_feats], proposals)
+        return losses, detections
