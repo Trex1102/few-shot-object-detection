@@ -19,18 +19,18 @@ from torchvision.models.segmentation import deeplabv3_resnet101
 from torchvision.models._utils import IntermediateLayerGetter
 
 default_build_roi_heads = __import__('fsdet.modeling.roi_heads', fromlist=['build_roi_heads']).build_roi_heads
-from fsdet.modeling.roi_heads.parallel_fusion_roi_heads import ParallelFusionROIHeads
+from fsdet.modeling.roi_heads.roi_heads import ParallelFusionROIHeads
 
 
 # avoid conflicting with the existing GeneralizedRCNN module in Detectron2
 from .build import META_ARCH_REGISTRY
 
-__all__ = ["GeneralizedRCNN", "ProposalNetwork"
+__all__ = ["ContextShapeRCNN"
 ]
 
 
 @META_ARCH_REGISTRY.register()
-class GeneralizedRCNN(nn.Module):
+class ContextShapeRCNN(nn.Module):
     """
     Generalized R-CNN. Any models that contains the following three components:
     1. Per-image feature extraction (aka backbone)
@@ -210,72 +210,3 @@ class GeneralizedRCNN(nn.Module):
         return images
 
 
-@META_ARCH_REGISTRY.register()
-class ProposalNetwork(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.device = torch.device(cfg.MODEL.DEVICE)
-
-        self.backbone = build_backbone(cfg)
-        self.proposal_generator = build_proposal_generator(
-            cfg, self.backbone.output_shape()
-        )
-
-        pixel_mean = (
-            torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(-1, 1, 1)
-        )
-        pixel_std = (
-            torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(-1, 1, 1)
-        )
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
-        self.to(self.device)
-
-    def forward(self, batched_inputs):
-        """
-        Args:
-            Same as in :class:`GeneralizedRCNN.forward`
-
-        Returns:
-            list[dict]: Each dict is the output for one input image.
-                The dict contains one key "proposals" whose value is a
-                :class:`Instances` with keys "proposal_boxes" and "objectness_logits".
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        images = [self.normalizer(x) for x in images]
-        images = ImageList.from_tensors(
-            images, self.backbone.size_divisibility
-        )
-        features = self.backbone(images.tensor)
-
-        if "instances" in batched_inputs[0]:
-            gt_instances = [
-                x["instances"].to(self.device) for x in batched_inputs
-            ]
-        elif "targets" in batched_inputs[0]:
-            log_first_n(
-                logging.WARN,
-                "'targets' in the model inputs is now renamed to 'instances'!",
-                n=10,
-            )
-            gt_instances = [
-                x["targets"].to(self.device) for x in batched_inputs
-            ]
-        else:
-            gt_instances = None
-        proposals, proposal_losses = self.proposal_generator(
-            images, features, gt_instances
-        )
-        # In training, the proposals are not useful at all but we generate them anyway.
-        # This makes RPN-only models about 5% slower.
-        if self.training:
-            return proposal_losses
-
-        processed_results = []
-        for results_per_image, input_per_image, image_size in zip(
-            proposals, batched_inputs, images.image_sizes
-        ):
-            height = input_per_image.get("height", image_size[0])
-            width = input_per_image.get("width", image_size[1])
-            r = detector_postprocess(results_per_image, height, width)
-            processed_results.append({"proposals": r})
-        return processed_results

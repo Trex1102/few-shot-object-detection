@@ -10,6 +10,10 @@ from detectron2.modeling.backbone.resnet import BottleneckBlock, make_stage
 from detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.modeling.matcher import Matcher
 from detectron2.modeling.poolers import ROIPooler
+from detectron2.layers import ShapeSpec
+from detectron2.structures import Boxes
+
+
 from detectron2.modeling.proposal_generator.proposal_utils import (
     add_ground_truth_to_proposals,
 )
@@ -21,6 +25,12 @@ from torch import nn
 
 from .box_head import build_box_head
 from .fast_rcnn import ROI_HEADS_OUTPUT_REGISTRY, FastRCNNOutputs
+
+from detectron2.modeling.roi_heads.fast_rcnn import FastRCNNOutputLayers
+
+from .context_branch import ContextBranch
+from .shape_branch import ShapeBranch
+
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
 ROI_HEADS_REGISTRY.__doc__ = """
@@ -496,47 +506,71 @@ class StandardROIHeads(ROIHeads):
             return pred_instances
 
 
+
 @ROI_HEADS_REGISTRY.register()
 class ParallelFusionROIHeads(StandardROIHeads):
-    """
-    Parallel Feature Fusion:
-      - context branch
-      - shape branch
-      - fuse with RoI features
-    """
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
-        # assume box head produces 256-dim features
+        # parallel branches
+        pooler_res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
         self.context_branch = ContextBranch(
-            feature_strides=[stride for stride in self.box_in_features],
-            output_size=7
+            feature_strides=[input_shape[f].stride for f in self.in_features],
+            output_size=pooler_res
         )
-        self.shape_branch = ShapeBranch(in_channels=256)
-        # override box predictor to accept fused dim
+        in_ch = input_shape[self.in_features[0]].channels
+        self.shape_branch = ShapeBranch(in_channels=in_ch)
+        # compute feature dims
+        head_feat_dim = self.box_head.output_size
+        context_feat_dim = 256 * pooler_res * pooler_res
+        shape_feat_dim = 256
+        fused_dim = head_feat_dim + context_feat_dim + shape_feat_dim
+        # batch norm on fused vector
+        self.fusion_bn = nn.BatchNorm1d(fused_dim)
+        # override predictor
         self.box_predictor = FastRCNNOutputLayers(
-            # input channels = original + context + shape
-            in_channels=256 + 256 + 256,
-            **self.cfg.MODEL.ROI_BOX_HEAD.PREDICTOR_PARAMS
+            cfg,
+            ShapeSpec(channels=fused_dim, height=1, width=1)
         )
 
     def _forward_box(self, features, proposals):
-        # extract standard RoI features
-        box_feats = self.box_pooler(
-            features, [x.proposal_boxes for x in proposals], [x._image_index for x in proposals]
-        )  # list of tensors
-        box_feats = self.box_head(box_feats)
-        # get context and shape
+        # 1) pooled features
+        pooled = self.box_pooler(
+            features,
+            [p.proposal_boxes for p in proposals]
+        )  # R x C x H x W
+        # 2) box head features
+        head_feats = self.box_head(pooled)  # R x D
+        num_rois = [len(p) for p in proposals]
+        head_list = list(head_feats.split(num_rois, dim=0))
+        # 3) context features
         ctx_feats = self.context_branch(features, proposals)
-        shp_feats = self.shape_branch(box_feats)
-        # fuse: for each image, concat per proposal
-        fused_feats = []
-        for bf, cf, sf in zip(box_feats, ctx_feats, shp_feats):
-            # bf: N x C x S x S, cf: N x C x S x S, sf: N x C_vec
-            # flatten and concat
-            bf_flat = bf.view(bf.size(0), -1)
-            cf_flat = cf.view(cf.size(0), -1)
-            fused = torch.cat([bf_flat, cf_flat, sf], dim=1)
-            fused_feats.append(fused)
-        # run predictor
-        losses, detections = self.box_predictor([f.view(-1) for f in fused_feats], proposals)
-        return losses, detections
+        ctx_flat = [cf.view(cf.size(0), -1) for cf in ctx_feats]
+        # 4) shape features
+        roi_list = list(pooled.split(num_rois, dim=0))
+        shp_feats = self.shape_branch(roi_list)
+        # 5) fuse and normalize
+        fused_list = []
+        for hf, cf, sf in zip(head_list, ctx_flat, shp_feats):
+            vec = torch.cat([hf, cf, sf], dim=1)
+            fused_list.append(vec)
+        fused_feats = torch.cat(fused_list, dim=0)  # R x fused_dim
+        fused_feats = self.fusion_bn(fused_feats)
+        # 6) prediction
+        pred_logits, pred_deltas = self.box_predictor(fused_feats)
+        outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            pred_logits,
+            pred_deltas,
+            proposals,
+            self.smooth_l1_beta
+        )
+        if self.training:
+            return outputs.losses()
+        else:
+            instances, _ = outputs.inference(
+                self.test_score_thresh,
+                self.test_nms_thresh,
+                self.test_detections_per_img
+            )
+            return instances
+
