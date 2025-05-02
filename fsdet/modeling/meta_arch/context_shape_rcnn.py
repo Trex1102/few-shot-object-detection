@@ -21,6 +21,8 @@ from torchvision.models._utils import IntermediateLayerGetter
 default_build_roi_heads = __import__('fsdet.modeling.roi_heads', fromlist=['build_roi_heads']).build_roi_heads
 from fsdet.modeling.roi_heads.roi_heads import ParallelFusionROIHeads
 from fsdet.modeling.roi_heads.roi_heads import ParallelFusionROIHeadsWithLoss
+from fsdet.modeling.roi_heads.roi_heads import ParallelFusionROIHeadsBottleneck
+from fsdet.modeling.roi_heads.roi_heads import ParallelFusionROIHeadsSE
 
 
 # avoid conflicting with the existing GeneralizedRCNN module in Detectron2
@@ -47,7 +49,7 @@ class ContextShapeRCNN(nn.Module):
         self.proposal_generator = build_proposal_generator(
             cfg, self.backbone.output_shape()
         )
-        self.roi_heads = ParallelFusionROIHeadsWithLoss(cfg, self.backbone.output_shape())
+        self.roi_heads = ParallelFusionROIHeadsBottleneck(cfg, self.backbone.output_shape())
 
         assert len(cfg.MODEL.PIXEL_MEAN) == len(cfg.MODEL.PIXEL_STD)
         num_channels = len(cfg.MODEL.PIXEL_MEAN)

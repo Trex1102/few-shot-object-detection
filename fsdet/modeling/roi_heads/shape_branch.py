@@ -7,7 +7,7 @@ from detectron2.modeling.roi_heads import ROI_HEADS_REGISTRY, StandardROIHeads
 from detectron2.modeling.poolers import ROIPooler
 import torch.nn.functional as F
 
-class ShapeBranch(nn.Module):
+class ShapeBranchBottleneck(nn.Module):
     """
     Shape mask -> vector.
     """
@@ -28,7 +28,7 @@ class ShapeBranch(nn.Module):
             outputs.append(vec)
         return outputs  # list of Ni x 256
 
-class ShapeBranch2(nn.Module):
+class ShapeBranch(nn.Module):
     """
     Bounding Shape Mask Branch (BshapeNet):
     Predicts a boundary mask and returns pooled shape features.
@@ -87,4 +87,32 @@ class ShapeBranchWithLoss(nn.Module):
                 m = F.adaptive_avg_pool2d(gt_masks[idx].unsqueeze(1).float(), (1,1)).flatten(1)
                 loss = F.binary_cross_entropy_with_logits(mask_logits.flatten(1), m)
                 aux_losses[f"shape_loss_{idx}"] = loss
+        return outputs, aux_losses
+
+
+class ShapeBranchSE(nn.Module):
+    """
+    Shape auto-encoder branch with reconstruction loss.
+    """
+    def __init__(self, in_channels, embedding_dim=128):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_channels, 256, 3, padding=1), nn.ReLU(inplace=True)
+        )
+        self.fc_embed = nn.Linear(256, embedding_dim)
+        self.fc_decode = nn.Linear(embedding_dim, 256)
+        self.dec = nn.Sequential(nn.ReLU(inplace=True), nn.Conv2d(256,1,1))
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+
+    def forward(self, roi_pooled, gt_masks=None):
+        outputs, aux_losses = [], {}
+        for idx, feats in enumerate(roi_pooled):
+            x = self.enc(feats)
+            vec = self.avgpool(x).flatten(1)
+            emb = self.fc_embed(vec)
+            decoded = self.dec(self.fc_decode(emb).view(-1,256,1,1))
+            outputs.append(emb)
+            if self.training and gt_masks is not None:
+                m = F.adaptive_avg_pool2d(gt_masks[idx].unsqueeze(1).float(), (1,1)).flatten(1)
+                aux_losses[f"shape_loss_{idx}"] = F.binary_cross_entropy_with_logits(decoded.flatten(1), m)
         return outputs, aux_losses

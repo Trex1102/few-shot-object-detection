@@ -32,6 +32,15 @@ from .context_branch import ContextBranch
 from .shape_branch import ShapeBranch
 from .context_branch import ContextBranchWithLoss
 from .shape_branch import ShapeBranchWithLoss
+from .context_branch import ContextBranchBottleneck
+from .shape_branch import ShapeBranchBottleneck
+from .context_branch import ContextBranchSE
+from .shape_branch import ShapeBranchSE 
+
+
+from fsdet.modeling.fusion.se import SEFusion
+
+
 
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
@@ -508,7 +517,7 @@ class StandardROIHeads(ROIHeads):
             return pred_instances
 
 @ROI_HEADS_REGISTRY.register()
-class ParallelFusionROIHeads(StandardROIHeads):
+class ParallelFusionROIHeadsBottleneck(StandardROIHeads):
     """
     Lightweight projection fusion: project each branch to 256-dim.
     """
@@ -518,8 +527,8 @@ class ParallelFusionROIHeads(StandardROIHeads):
         strides = [input_shape[f].stride for f in self.in_features]
         in_ch = input_shape[self.in_features[0]].channels
         # branches
-        self.context_branch = ContextBranch(strides, output_size=res)
-        self.shape_branch = ShapeBranch(in_channels=in_ch)
+        self.context_branch = ContextBranchBottleneck(strides, output_size=res)
+        self.shape_branch = ShapeBranchBottleneck(in_channels=in_ch)
         # projection modules
         head_dim = self.box_head.output_size
         self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
@@ -567,7 +576,7 @@ class ParallelFusionROIHeads(StandardROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
-class ParallelFusionROIHeads2(StandardROIHeads):
+class ParallelFusionROIHeads(StandardROIHeads):
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
         # parallel branches
@@ -645,8 +654,8 @@ class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
         strides = [input_shape[f].stride for f in self.in_features]
         in_ch = input_shape[self.in_features[0]].channels
         num_cls = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        self.context_branch = ContextBranch(strides, output_size=res, num_classes=num_cls)
-        self.shape_branch = ShapeBranch(in_channels=in_ch, embedding_dim=128)
+        self.context_branch = ContextBranchWithLoss(strides, output_size=res, num_classes=num_cls)
+        self.shape_branch = ShapeBranchWithLoss(in_channels=in_ch, embedding_dim=128)
         # projection
         head_dim = self.box_head.output_size
         self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
@@ -692,3 +701,53 @@ class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
             inst, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
             return inst
 
+@ROI_HEADS_REGISTRY.register()
+class ParallelFusionROIHeadsSE(StandardROIHeads):
+    """
+    Channel-wise attention fusion via SE using learned branch embeddings.
+    """
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        strides = [input_shape[f].stride for f in self.in_features]
+        in_ch = input_shape[self.in_features[0]].channels
+        num_cls = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        # branches
+        self.context_branch = ContextBranchSE(strides, output_size=res, num_classes=num_cls)
+        self.shape_branch = ShapeBranchSE(in_channels=in_ch, embedding_dim=128)
+        # SE fusion: input C, embeddings 256+128
+        channel_dim = self.box_head.output_size // (res*res)
+        self.se_fusion = SEFusion(channel_dim, emb_dim=256+128)
+        # predictor
+        self.box_predictor = FastRCNNOutputLayers(
+            cfg, ShapeSpec(channels=channel_dim, height=1, width=1)
+        )
+
+    def _forward_box(self, features, proposals, targets=None):
+        pooled = self.box_pooler(features, [p.proposal_boxes for p in proposals])
+        # split per image
+        nums = [len(p) for p in proposals]
+        roi_list = list(pooled.split(nums, dim=0))
+        gt_classes = [p.gt_classes for p in proposals]
+        gt_masks = [t.gt_masks.tensor for t in targets] if targets is not None else None
+        # branch outputs
+        ctx_vecs, ctx_losses = self.context_branch(features, proposals, gt_classes)
+        shp_vecs, shp_losses = self.shape_branch(roi_list, gt_masks)
+        # fuse channel-wise
+        fused_maps = []
+        for fmap, cv, sv in zip(roi_list, ctx_vecs, shp_vecs):
+            fused_maps.append(self.se_fusion(fmap, cv, sv))
+        fused = torch.cat(fused_maps, dim=0)
+        # box head on fused maps
+        head_feats = self.box_head(fused)
+        flat = head_feats.flatten(start_dim=1)
+        logits, deltas = self.box_predictor(flat)
+        outputs = FastRCNNOutputs(self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta)
+        if self.training:
+            losses = outputs.losses()
+            losses.update(ctx_losses)
+            losses.update(shp_losses)
+            return losses
+        else:
+            inst, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
+            return inst
