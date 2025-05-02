@@ -30,6 +30,8 @@ from detectron2.modeling.roi_heads.fast_rcnn import FastRCNNOutputLayers
 
 from .context_branch import ContextBranch
 from .shape_branch import ShapeBranch
+from .context_branch import ContextBranchWithLoss
+from .shape_branch import ShapeBranchWithLoss
 
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
@@ -505,10 +507,67 @@ class StandardROIHeads(ROIHeads):
             )
             return pred_instances
 
+@ROI_HEADS_REGISTRY.register()
+class ParallelFusionROIHeads(StandardROIHeads):
+    """
+    Lightweight projection fusion: project each branch to 256-dim.
+    """
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        strides = [input_shape[f].stride for f in self.in_features]
+        in_ch = input_shape[self.in_features[0]].channels
+        # branches
+        self.context_branch = ContextBranch(strides, output_size=res)
+        self.shape_branch = ShapeBranch(in_channels=in_ch)
+        # projection modules
+        head_dim = self.box_head.output_size
+        self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
+        self.ctx_proj = nn.Sequential(nn.Linear(256,256), nn.ReLU(inplace=True))
+        self.shp_proj = nn.Sequential(nn.Linear(256,256), nn.ReLU(inplace=True))
+        # fusion norm
+        self.fusion_bn = nn.BatchNorm1d(256*3)
+        # predictor on 768-d
+        self.box_predictor = FastRCNNOutputLayers(
+            cfg, ShapeSpec(channels=256*3, height=1, width=1)
+        )
+
+    def _forward_box(self, features, proposals):
+        # 1) pooled and box_head: R x C x H x W -> R x D
+        pooled = self.box_pooler(features, [p.proposal_boxes for p in proposals])
+        head = self.box_head(pooled)
+        D = head.view(head.size(0), -1)
+        # split per image
+        nums = [len(p) for p in proposals]
+        head_list = list(D.split(nums, dim=0))  # Ni x head_dim
+        # project box
+        box_vecs = [self.box_proj(h) for h in head_list]
+        # 2) context vectors
+        ctx_vecs = [self.ctx_proj(v) for v in self.context_branch(features, proposals)]
+        # 3) shape vectors: need roi_pooled list
+        roi_list = list(pooled.split(nums, dim=0))
+        shp_vecs = [self.shp_proj(v) for v in self.shape_branch(roi_list)]
+        # fuse per image
+        fused = [torch.cat([b,c,s], dim=1) for b,c,s in zip(box_vecs, ctx_vecs, shp_vecs)]
+        F = torch.cat(fused, dim=0)
+        F = self.fusion_bn(F)
+        # predict
+        logits, deltas = self.box_predictor(F)
+        outputs = FastRCNNOutputs(
+            self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta
+        )
+        if self.training:
+            return outputs.losses()
+        else:
+            inst, _ = outputs.inference(
+                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
+            )
+            return inst
+
 
 
 @ROI_HEADS_REGISTRY.register()
-class ParallelFusionROIHeads(StandardROIHeads):
+class ParallelFusionROIHeads2(StandardROIHeads):
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
         # parallel branches
@@ -573,4 +632,63 @@ class ParallelFusionROIHeads(StandardROIHeads):
                 self.test_detections_per_img
             )
             return instances
+
+
+@ROI_HEADS_REGISTRY.register()
+class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
+    """
+    Fusion with decoupled pretraining branches.
+    """
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        strides = [input_shape[f].stride for f in self.in_features]
+        in_ch = input_shape[self.in_features[0]].channels
+        num_cls = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        self.context_branch = ContextBranch(strides, output_size=res, num_classes=num_cls)
+        self.shape_branch = ShapeBranch(in_channels=in_ch, embedding_dim=128)
+        # projection
+        head_dim = self.box_head.output_size
+        self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
+        self.ctx_proj = nn.Sequential(nn.Linear(256,256), nn.ReLU(inplace=True))
+        self.shp_proj = nn.Sequential(nn.Linear(128,256), nn.ReLU(inplace=True))
+        self.fusion_bn = nn.BatchNorm1d(256*3)
+        self.box_predictor = FastRCNNOutputLayers(
+            cfg, ShapeSpec(channels=256*3, height=1, width=1)
+        )
+
+    def _forward_box(self, features, proposals, targets=None):
+        pooled = self.box_pooler(features, [p.proposal_boxes for p in proposals])
+        head_feats = self.box_head(pooled)
+        D = head_feats.view(head_feats.size(0), -1)
+        nums = [len(p) for p in proposals]
+        head_list = list(D.split(nums, dim=0))
+        # gather gt
+        gt_classes = [p.gt_classes for p in proposals]
+        gt_masks = None
+        if targets is not None:
+            gt_masks = [t.gt_masks.tensor for t in targets]
+        # branches
+        ctx_vectors, ctx_losses = self.context_branch(features, proposals, gt_classes)
+        roi_list = list(pooled.split(nums, dim=0))
+        shp_vectors, shp_losses = self.shape_branch(roi_list, gt_masks)
+        # project
+        box_vecs = [self.box_proj(h) for h in head_list]
+        ctx_vecs = [self.ctx_proj(v) for v in ctx_vectors]
+        shp_vecs = [self.shp_proj(v) for v in shp_vectors]
+        # fusion
+        fused = [torch.cat([b,c,s], dim=1) for b,c,s in zip(box_vecs,ctx_vecs,shp_vecs)]
+        Fcat = torch.cat(fused, dim=0)
+        Fnorm = self.fusion_bn(Fcat)
+        logits, deltas = self.box_predictor(Fnorm)
+        outputs = FastRCNNOutputs(self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta)
+        losses = {}
+        if self.training:
+            losses.update(outputs.losses())
+            losses.update(ctx_losses)
+            losses.update(shp_losses)
+            return losses
+        else:
+            inst, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
+            return inst
 
