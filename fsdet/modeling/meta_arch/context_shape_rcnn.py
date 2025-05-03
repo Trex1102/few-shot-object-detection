@@ -34,12 +34,6 @@ __all__ = ["ContextShapeRCNN"
 
 @META_ARCH_REGISTRY.register()
 class ContextShapeRCNN(nn.Module):
-    """
-    Generalized R-CNN. Any models that contains the following three components:
-    1. Per-image feature extraction (aka backbone)
-    2. Region proposal generation
-    3. Per-region feature extraction and prediction
-    """
 
     def __init__(self, cfg):
         super().__init__()
@@ -49,7 +43,7 @@ class ContextShapeRCNN(nn.Module):
         self.proposal_generator = build_proposal_generator(
             cfg, self.backbone.output_shape()
         )
-        self.roi_heads = ParallelFusionROIHeadsBottleneck(cfg, self.backbone.output_shape())
+        self.roi_heads = ParallelFusionROIHeadsWithLoss(cfg, self.backbone.output_shape())
 
         assert len(cfg.MODEL.PIXEL_MEAN) == len(cfg.MODEL.PIXEL_STD)
         num_channels = len(cfg.MODEL.PIXEL_MEAN)
@@ -65,6 +59,13 @@ class ContextShapeRCNN(nn.Module):
         )
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
         self.to(self.device)
+
+        if cfg.MODEL.BRANCHES.FREEZE:
+            for name, module in self.roi_heads.named_children():
+                if name != "box_predictor":
+                    for p in module.parameters():
+                        p.requires_grad = False
+
 
         if cfg.MODEL.BACKBONE.FREEZE:
             for p in self.backbone.parameters():
@@ -82,28 +83,7 @@ class ContextShapeRCNN(nn.Module):
             print("froze roi_box_head parameters")
 
     def forward(self, batched_inputs):
-        """
-        Args:
-            batched_inputs: a list, batched outputs of :class:`DatasetMapper` .
-                Each item in the list contains the inputs for one image.
-                For now, each item in the list is a dict that contains:
-
-                * image: Tensor, image in (C, H, W) format.
-                * instances (optional): groundtruth :class:`Instances`
-                * proposals (optional): :class:`Instances`, precomputed proposals.
-
-                Other information that's included in the original dicts, such as:
-
-                * "height", "width" (int): the output resolution of the model, used in inference.
-                    See :meth:`postprocess` for details.
-
-        Returns:
-            list[dict]:
-                Each dict is the output for one input image.
-                The dict contains one key "instances" whose value is a :class:`Instances`.
-                The :class:`Instances` object has the following keys:
-                    "pred_boxes", "pred_classes", "scores"
-        """
+        
         if not self.training:
             return self.inference(batched_inputs)
 
@@ -149,22 +129,7 @@ class ContextShapeRCNN(nn.Module):
     def inference(
         self, batched_inputs, detected_instances=None, do_postprocess=True
     ):
-        """
-        Run inference on the given inputs.
-
-        Args:
-            batched_inputs (list[dict]): same as in :meth:`forward`
-            detected_instances (None or list[Instances]): if not None, it
-                contains an `Instances` object per image. The `Instances`
-                object contains "pred_boxes" and "pred_classes" which are
-                known boxes in the image.
-                The inference will then skip the detection of bounding boxes,
-                and only predict other per-ROI outputs.
-            do_postprocess (bool): whether to apply post-processing on the outputs.
-
-        Returns:
-            same as in :meth:`forward`.
-        """
+        
         assert not self.training
 
         images = self.preprocess_image(batched_inputs)

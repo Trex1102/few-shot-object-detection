@@ -1,6 +1,6 @@
 _BASE_: "../../../ContextShape-RCNN-FPN.yaml"
 MODEL:
-  WEIGHTS: "checkpoints/voc/faster_rcnn/faster_rcnn_R_101_FPN_ContextShape_Bottleneck_base2/model_reset_surgery.pth"
+  WEIGHTS: "checkpoints/voc/faster_rcnn/faster_rcnn_R_101_FPN_ContextShape_SE_base2/model_reset_surgery.pth"
   MASK_ON: False
   RESNETS:
     DEPTH: 101
@@ -25,4 +25,4 @@ SOLVER:
   MAX_ITER: 4000
   CHECKPOINT_PERIOD: 10000
   WARMUP_ITERS: 0
-OUTPUT_DIR: "checkpoints/voc/faster_rcnn/faster_rcnn_R_101_FPN_ContextShape_Bottleneck_all2_1shot_randnovel_0.005lr"
+OUTPUT_DIR: "checkpoints/voc/faster_rcnn/faster_rcnn_R_101_FPN_ContextShape_SE_all2_1shot_randnovel_0.005lr"

@@ -646,60 +646,114 @@ class ParallelFusionROIHeads(StandardROIHeads):
 @ROI_HEADS_REGISTRY.register()
 class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
     """
-    Fusion with decoupled pretraining branches.
+    Parallel fusion ROI heads with decoupled auxiliary losses.
+    Context and Shape branches are run on detached features to
+    avoid backprop into the backbone/RPN.
     """
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
+        # RoI pooler resolution and feature strides
         res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
         strides = [input_shape[f].stride for f in self.in_features]
         in_ch = input_shape[self.in_features[0]].channels
         num_cls = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-        self.context_branch = ContextBranchWithLoss(strides, output_size=res, num_classes=num_cls)
-        self.shape_branch = ShapeBranchWithLoss(in_channels=in_ch, embedding_dim=128)
-        # projection
+
+        # Auxiliary branches
+        self.context_branch = ContextBranchWithLoss(
+            feature_strides=strides,
+            output_size=res,
+            num_classes=num_cls
+        )
+        self.shape_branch = ShapeBranchWithLoss(
+            in_channels=in_ch,
+            embedding_dim=128
+        )
+
+        # Projection heads to 256-d
         head_dim = self.box_head.output_size
-        self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
-        self.ctx_proj = nn.Sequential(nn.Linear(256,256), nn.ReLU(inplace=True))
-        self.shp_proj = nn.Sequential(nn.Linear(128,256), nn.ReLU(inplace=True))
-        self.fusion_bn = nn.BatchNorm1d(256*3)
+        self.box_proj = nn.Sequential(
+            nn.Linear(head_dim, 256),
+            nn.ReLU(inplace=True)
+        )
+        self.ctx_proj = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True)
+        )
+        self.shp_proj = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.ReLU(inplace=True)
+        )
+
+        # Fusion normalization and predictor
+        self.fusion_bn = nn.BatchNorm1d(256 * 3)
         self.box_predictor = FastRCNNOutputLayers(
-            cfg, ShapeSpec(channels=256*3, height=1, width=1)
+            cfg, ShapeSpec(channels=256 * 3, height=1, width=1)
         )
 
     def _forward_box(self, features, proposals, targets=None):
-        pooled = self.box_pooler(features, [p.proposal_boxes for p in proposals])
-        head_feats = self.box_head(pooled)
-        D = head_feats.view(head_feats.size(0), -1)
+        """
+        Args:
+            features (list[Tensor]): one tensor per feature level.
+            proposals (list[Instances])
+            targets (list[Instances] or None)
+        Returns:
+            During training: dict of losses (detector + aux).
+            During inference: list of Instances.
+        """
+        # 1) RoI pooling + box head
+        pooled = self.box_pooler(
+            features, [p.proposal_boxes for p in proposals]
+        )  # (R, C, H, W)
+        box_feats = self.box_head(pooled)           # (R, C', H, W)
+        flat_feats = box_feats.view(box_feats.size(0), -1)  # (R, head_dim)
         nums = [len(p) for p in proposals]
-        head_list = list(D.split(nums, dim=0))
-        # gather gt
+        head_list = flat_feats.split(nums, dim=0)   # list of (Ni, head_dim)
+
+        # 2) Prepare targets
         gt_classes = [p.gt_classes for p in proposals]
-        gt_masks = None
-        if targets is not None:
-            gt_masks = [t.gt_masks.tensor for t in targets]
-        # branches
-        ctx_vectors, ctx_losses = self.context_branch(features, proposals, gt_classes)
-        roi_list = list(pooled.split(nums, dim=0))
-        shp_vectors, shp_losses = self.shape_branch(roi_list, gt_masks)
-        # project
+        gt_masks = [t.gt_masks.tensor for t in targets] if targets is not None else None
+
+        # 3) Auxiliary branches on detached inputs
+        detached_backbone = [f.detach() for f in features]
+        ctx_vecs, ctx_losses = self.context_branch(
+            detached_backbone, proposals, gt_classes
+        )
+
+        roi_list = pooled.split(nums, dim=0)
+        detached_rois = [r.detach() for r in roi_list]
+        shp_vecs, shp_losses = self.shape_branch(
+            detached_rois, gt_masks
+        )
+
+        # 4) Project each branch into 256-d vectors
         box_vecs = [self.box_proj(h) for h in head_list]
-        ctx_vecs = [self.ctx_proj(v) for v in ctx_vectors]
-        shp_vecs = [self.shp_proj(v) for v in shp_vectors]
-        # fusion
-        fused = [torch.cat([b,c,s], dim=1) for b,c,s in zip(box_vecs,ctx_vecs,shp_vecs)]
+        ctx_proj = [self.ctx_proj(v) for v in ctx_vecs]
+        shp_proj = [self.shp_proj(v) for v in shp_vecs]
+
+        # 5) Concatenate, normalize, and predict
+        fused = [torch.cat([b, c, s], dim=1)
+                 for b, c, s in zip(box_vecs, ctx_proj, shp_proj)]
         Fcat = torch.cat(fused, dim=0)
         Fnorm = self.fusion_bn(Fcat)
+
         logits, deltas = self.box_predictor(Fnorm)
-        outputs = FastRCNNOutputs(self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta)
-        losses = {}
+        outputs = FastRCNNOutputs(
+            self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta
+        )
+
         if self.training:
-            losses.update(outputs.losses())
+            losses = outputs.losses()
             losses.update(ctx_losses)
             losses.update(shp_losses)
             return losses
         else:
-            inst, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
-            return inst
+            instances, _ = outputs.inference(
+                self.test_score_thresh,
+                self.test_nms_thresh,
+                self.test_detections_per_img
+            )
+            return instances
+
 
 @ROI_HEADS_REGISTRY.register()
 class ParallelFusionROIHeadsSE(StandardROIHeads):

@@ -107,52 +107,68 @@ class ContextBranchBottleneck(nn.Module):
 
 class ContextBranchWithLoss(nn.Module):
     """
-    RoI Context Mining with auxiliary classification loss.
+    RoI Context Mining with auxiliary classification loss,
+    masking out invalid labels.
     """
     def __init__(self, feature_strides, output_size=7, num_classes=80, sampling_ratio=2):
         super().__init__()
+        self.num_classes = num_classes
         self.pooler = ROIPooler(
             output_size=(output_size, output_size),
-            scales=[1.0/s for s in feature_strides],
+            scales=[1.0 / s for s in feature_strides],
             sampling_ratio=sampling_ratio,
-            pooler_type="ROIAlignV2"
+            pooler_type="ROIAlignV2",
         )
-        # fuse 8 context crops -> feature map
-        self.conv = nn.Conv2d(256*8, 256, kernel_size=1)
+        self.conv = nn.Conv2d(256 * 8, 256, kernel_size=1)
         self.act = nn.ReLU(inplace=True)
-        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
-        # context classification head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.cls_head = nn.Linear(256, num_classes)
 
     def forward(self, features, proposals, gt_classes=None):
         all_boxes = []
         for props in proposals:
             boxes = props.proposal_boxes.tensor
-            w = (boxes[:,2]-boxes[:,0])/3.0; h = (boxes[:,3]-boxes[:,1])/3.0
+            w = (boxes[:, 2] - boxes[:, 0]) / 3.0
+            h = (boxes[:, 3] - boxes[:, 1]) / 3.0
             crops = []
             for i in range(3):
                 for j in range(3):
-                    if i==1 and j==1: continue
-                    crops.append(
-                        torch.stack([boxes[:,0]+j*w, boxes[:,1]+i*h,
-                                     boxes[:,0]+j*w+w, boxes[:,1]+i*h+h], dim=1)
-                    )
+                    if i == 1 and j == 1:
+                        continue
+                    crops.append(torch.stack([
+                        boxes[:, 0] + j * w,
+                        boxes[:, 1] + i * h,
+                        boxes[:, 0] + j * w + w,
+                        boxes[:, 1] + i * h + h
+                    ], dim=1))
             all_boxes.append(Boxes(torch.cat(crops, dim=0)))
-        ctx_feats = self.pooler(list(features), all_boxes)
-        outputs, ptr, aux_losses = [], 0, {}
+
+        # Fixed: features is a list of tensors
+        ctx_feats = self.pooler(features, all_boxes)
+
+        outputs, aux_losses = [], {}
+        ptr = 0
         for idx, props in enumerate(proposals):
             N = len(props)
-            chunk = ctx_feats[ptr:ptr+8*N]
-            ptr += 8*N
-            merged = self.act(self.conv(chunk.view(N, -1, chunk.size(-2), chunk.size(-1))))
+            chunk = ctx_feats[ptr:ptr + 8 * N]
+            ptr += 8 * N
+
+            merged = chunk.view(N, -1, chunk.size(-2), chunk.size(-1))
+            merged = self.act(self.conv(merged))
             vec = self.avgpool(merged).flatten(1)
             outputs.append(vec)
-            if self.training:
-                # auxiliary context class loss
+
+            if self.training and gt_classes is not None:
                 labels = gt_classes[idx]
-                logits = self.cls_head(vec)
-                aux_losses[f"ctx_loss_{idx}"] = F.cross_entropy(logits, labels)
+                valid = (labels >= 0) & (labels < self.num_classes)
+                if valid.any():
+                    logits = self.cls_head(vec[valid])
+                    aux_losses[f"ctx_loss_{idx}"] = F.cross_entropy(logits, labels[valid])
+                else:
+                    aux_losses[f"ctx_loss_{idx}"] = vec.new_tensor(0.0, requires_grad=True)
+
         return outputs, aux_losses
+
 
 
 class ContextBranchSE(nn.Module):
