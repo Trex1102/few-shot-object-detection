@@ -60,11 +60,11 @@ class ContextShapeRCNN(nn.Module):
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
         self.to(self.device)
 
-        if cfg.MODEL.BRANCHES.FREEZE:
-            for name, module in self.roi_heads.named_children():
-                if name != "box_predictor":
-                    for p in module.parameters():
-                        p.requires_grad = False
+        # if cfg.MODEL.BRANCHES.FREEZE:
+        #     for name, module in self.roi_heads.named_children():
+        #         if name != "box_predictor":
+        #             for p in module.parameters():
+        #                 p.requires_grad = False
 
 
         if cfg.MODEL.BACKBONE.FREEZE:
