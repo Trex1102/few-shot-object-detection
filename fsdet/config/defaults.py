@@ -1,8 +1,15 @@
 from detectron2.config.defaults import _C
+from detectron2.config import CfgNode as CN
 
 # adding additional default values built on top of the default values in detectron2
 
 _CC = _C
+
+# Few‐Shot extension subtree
+_CC.MODEL.FSOD = CN()
+_CC.MODEL.FSOD.STAGE2 = False
+_CC.MODEL.FSOD.CTX_LOSS_WEIGHT = 0.1
+_CC.MODEL.FSOD.SHP_LOSS_WEIGHT = 0.1
 
 # FREEZE Parameters
 _CC.MODEL.BACKBONE.FREEZE = False

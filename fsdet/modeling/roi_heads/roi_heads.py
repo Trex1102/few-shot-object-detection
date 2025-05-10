@@ -645,123 +645,91 @@ class ParallelFusionROIHeads(StandardROIHeads):
 
 @ROI_HEADS_REGISTRY.register()
 class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
-    """
-    Parallel fusion ROI heads with decoupled auxiliary losses.
-    Context and Shape branches are run on detached features to
-    avoid backprop into the backbone/RPN.
-    """
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
-        # RoI pooler resolution and feature strides
-        fsod_cfg = cfg.MODEL.get("FSOD", {})
-        self.stage2     = fsod_cfg.get("STAGE2", False)
-        self.ctx_weight = fsod_cfg.get("CTX_LOSS_WEIGHT", 1.0)
-        self.shp_weight = fsod_cfg.get("SHP_LOSS_WEIGHT", 1.0)
+        self.stage2     = cfg.MODEL.FSOD.STAGE2
+        self.ctx_weight = cfg.MODEL.FSOD.CTX_LOSS_WEIGHT
+        self.shp_weight = cfg.MODEL.FSOD.SHP_LOSS_WEIGHT
 
-        res = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
+        res     = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
         strides = [input_shape[f].stride for f in self.in_features]
-        in_ch = input_shape[self.in_features[0]].channels
+        in_ch   = input_shape[self.in_features[0]].channels
         num_cls = cfg.MODEL.ROI_HEADS.NUM_CLASSES
 
-        # Auxiliary branches
-        self.context_branch = ContextBranchWithLoss(
-            feature_strides=strides,
-            output_size=res,
-            num_classes=num_cls
-        )
-        self.shape_branch = ShapeBranchWithLoss(
-            in_channels=in_ch,
-            embedding_dim=128
-        )
+        self.context_branch = ContextBranchWithLoss(strides, res, num_cls)
+        self.shape_branch   = ShapeBranchWithLoss(in_ch, 128)
 
-        # Projection heads to 256-d
         head_dim = self.box_head.output_size
-        self.box_proj = nn.Sequential(
-            nn.Linear(head_dim, 256),
-            nn.ReLU(inplace=True)
-        )
-        self.ctx_proj = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True)
-        )
-        self.shp_proj = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.ReLU(inplace=True)
-        )
+        self.box_proj = nn.Sequential(nn.Linear(head_dim,256), nn.ReLU(inplace=True))
+        self.ctx_proj = nn.Sequential(nn.Linear(256,256), nn.ReLU(inplace=True))
+        self.shp_proj = nn.Sequential(nn.Linear(128,256), nn.ReLU(inplace=True))
 
-        # Fusion normalization and predictor
-        self.fusion_bn = nn.BatchNorm1d(256 * 3)
+        self.fusion_bn     = nn.BatchNorm1d(256*3)
         self.box_predictor = FastRCNNOutputLayers(
-            cfg, ShapeSpec(channels=256 * 3, height=1, width=1)
+            cfg, ShapeSpec(channels=256*3, height=1, width=1)
         )
 
     def _forward_box(self, features, proposals, targets=None):
-        """
-        Unified train/inference for fused head.
-        """
-        # 1) RoI pooling + box head
+        # 1) Pool + box head
         pooled    = self.box_pooler(features, [p.proposal_boxes for p in proposals])
-        box_feats = self.box_head(pooled)                  # R×C×H×W
-        flat      = box_feats.view(box_feats.size(0), -1)  # R×head_dim
+        box_feats = self.box_head(pooled)
+        flat      = box_feats.view(box_feats.size(0), -1)
         nums      = [len(p) for p in proposals]
         head_list = flat.split(nums, dim=0)
 
-        # 2) Prepare GT only if training
-        if self.training and targets is not None:
-            gt_classes = [p.gt_classes for p in proposals]
-            gt_masks   = [t.gt_masks.tensor for t in targets]
-        else:
-            gt_classes = None
-            gt_masks   = None
+        # 2) Always extract ground-truth info if available
+        gt_classes = [p.gt_classes for p in proposals]
+        gt_masks   = [t.gt_masks.tensor for t in targets] if targets is not None else [None]*len(proposals)
 
-        # 3) Run aux branches only in training Stage1
+        # 3) Auxiliary branch calls only in Stage1 + training
         if self.training and not self.stage2:
-            detached_feats  = [f.detach() for f in features]
+            detached_feats = [f.detach() for f in features]
             ctx_vecs, ctx_losses = self.context_branch(detached_feats, proposals, gt_classes)
 
-            roi_list        = pooled.split(nums, dim=0)
-            detached_rois   = [r.detach() for r in roi_list]
+            roi_list      = pooled.split(nums, dim=0)
+            detached_rois = [r.detach() for r in roi_list]
             shp_vecs, shp_losses = self.shape_branch(detached_rois, gt_masks)
         else:
-            # dummy empty losses and vectors for Stage2 or inference
-            ctx_vecs = [head.new_zeros(head.size(0), 256) for head in head_list]
-            shp_vecs = [head.new_zeros(head.size(0), 128) for head in head_list]
+            # make zeroed‐out embeddings so projection still works
+            ctx_vecs   = [h.new_zeros(h.size(0), 256) for h in head_list]
+            shp_vecs   = [h.new_zeros(h.size(0), 128) for h in head_list]
             ctx_losses = {}
             shp_losses = {}
 
-        # 4) Project into 256-d
+        # 4) Project features
         box_vecs = [self.box_proj(h) for h in head_list]
-        ctx_proj = [self.ctx_proj(v) for v in ctx_vecs]
-        shp_proj = [self.shp_proj(v) for v in shp_vecs]
+        cvecs    = [self.ctx_proj(v) for v in ctx_vecs]
+        svecs    = [self.shp_proj(v) for v in shp_vecs]
 
-        # 5) Fuse & normalize
-        fused  = [torch.cat([b, c, s], dim=1)
-                for b, c, s in zip(box_vecs, ctx_proj, shp_proj)]
-        Fcat   = torch.cat(fused, dim=0)
-        Fnorm  = self.fusion_bn(Fcat)
+        # 5) Fuse & predict
+        fused = [torch.cat([b,c,s], dim=1) for b,c,s in zip(box_vecs,cvecs,svecs)]
+        Fcat  = torch.cat(fused, dim=0)
+        Fnorm = self.fusion_bn(Fcat)
 
-        # 6) Predict
         logits, deltas = self.box_predictor(Fnorm)
         outputs = FastRCNNOutputs(
             self.box2box_transform, logits, deltas, proposals, self.smooth_l1_beta
         )
 
         if self.training:
-            # detection loss
             losses = outputs.losses()
-            # add aux if in Stage1
             if not self.stage2:
+                # average the per-image losses
                 avg_ctx = sum(ctx_losses.values()) / max(1, len(ctx_losses))
                 avg_shp = sum(shp_losses.values()) / max(1, len(shp_losses))
                 losses["ctx_loss"] = avg_ctx * self.ctx_weight
                 losses["shp_loss"] = avg_shp * self.shp_weight
+
+            # convert any floats → tensors for the logger
+            for k,v in list(losses.items()):
+                if not isinstance(v, torch.Tensor):
+                    losses[k] = torch.tensor(v, device=flat.device)
             return losses
         else:
-            # fused inference
-            pred_instances, _ = outputs.inference(
+            pred_inst, _ = outputs.inference(
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
-            return pred_instances
+            return pred_inst
 
 
 @ROI_HEADS_REGISTRY.register()
