@@ -601,6 +601,10 @@ class ParallelFusionROIHeads(StandardROIHeads):
         )
 
     def _forward_box(self, features, proposals):
+
+        # at top of ParallelFusionROIHeadsWithLoss._forward_box
+        
+
         # 1) pooled features
         pooled = self.box_pooler(
             features,
@@ -670,6 +674,7 @@ class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
         )
 
     def _forward_box(self, features, proposals, targets=None):
+        
         # 1) Pool + box head
         pooled    = self.box_pooler(features, [p.proposal_boxes for p in proposals])
         box_feats = self.box_head(pooled)
@@ -677,12 +682,11 @@ class ParallelFusionROIHeadsWithLoss(StandardROIHeads):
         nums      = [len(p) for p in proposals]
         head_list = flat.split(nums, dim=0)
 
-        # 2) Always extract ground-truth info if available
-        gt_classes = [p.gt_classes for p in proposals]
-        gt_masks   = [t.gt_masks.tensor for t in targets] if targets is not None else [None]*len(proposals)
-
         # 3) Auxiliary branch calls only in Stage1 + training
         if self.training and not self.stage2:
+            gt_classes = [p.gt_classes for p in proposals]
+            gt_masks   = [t.gt_masks.tensor for t in targets] if targets is not None else [None]*len(proposals)
+            # print("DEBUG: gt_masks shapes:", [m.shape if m is not None else None for m in gt_masks])
             detached_feats = [f.detach() for f in features]
             ctx_vecs, ctx_losses = self.context_branch(detached_feats, proposals, gt_classes)
 
