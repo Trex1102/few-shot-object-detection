@@ -1,4 +1,5 @@
-import logging
+
+import torch
 from torch import nn
 import torch.nn.functional as F
 
@@ -18,10 +19,13 @@ class ShapeFPN(nn.Module):
         ])
 
     def forward(self, inputs):
-        # inputs: list of feature maps [P2, P3, P4, P5]
+        # inputs: list of FPN feature maps [P2...PN]
         laters = [l(x) for l, x in zip(self.lateral_convs, inputs)]
+        # top-down merge with exact size matching
         for i in range(len(laters)-1, 0, -1):
+            target_size = laters[i-1].shape[-2:]
             laters[i-1] = laters[i-1] + F.interpolate(
-                laters[i], scale_factor=2, mode="nearest"
+                laters[i], size=target_size, mode="nearest"
             )
-        return [out(l) for out, l in zip(self.output_convs, laters)]
+        outs = [out(l) for out, l in zip(self.output_convs, laters)]
+        return outs

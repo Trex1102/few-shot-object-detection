@@ -1,4 +1,5 @@
 import cv2
+import torch 
 
 def compute_edge_map(img_tensor):
     # img_tensor: CxHxW normalized [0,1]
